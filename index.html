@@ -31,6 +31,9 @@ input[type=range]{width:100%}
 .canvas-box{margin-top:.6rem;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:.6rem;display:flex;justify-content:center;overflow:auto}
 canvas{max-width:100%;height:auto;background:#fff}
 #loading{display:none;position:fixed;inset:0;background:rgba(22,36,58,.8);color:#fff;z-index:9;align-items:center;justify-content:center;text-align:center;padding:2rem;font-weight:600}
+#saveModal{display:none;position:fixed;inset:0;background:rgba(22,36,58,.92);z-index:10;flex-direction:column;align-items:center;justify-content:center;gap:.8rem;padding:1rem;color:#fff;text-align:center}
+#saveModal img{max-width:100%;max-height:68vh;background:#fff;border-radius:8px;-webkit-touch-callout:default;-webkit-user-select:auto;user-select:auto}
+#saveModal button{flex:none;background:#fff;color:var(--ink);padding:.7rem 2rem}
 @media(min-width:768px){.wrap{grid-template-columns:repeat(2,1fr)}header,.result{grid-column:span 2}}
 @media(min-width:1024px){.wrap{grid-template-columns:repeat(3,1fr)}header,.result{grid-column:span 3}}
 </style>
@@ -73,11 +76,13 @@ canvas{max-width:100%;height:auto;background:#fff}
 </div>
 <div id="loading"><div>圖紙特徵分析與空間配準中…<br><small>請稍候</small></div></div>
 
+<div id="saveModal" role="dialog" aria-modal="true"><p>請長按下方圖片，選擇「儲存圖片 / 加入照片」</p><img id="saveImg" alt="比對結果"><button id="saveClose">關閉</button></div>
+
 <script>
 const $ = id => document.getElementById(id);
 const MAXSIDE = 2000;                    // 運算最大邊長，避免手機/大圖記憶體爆掉
 const imgs = {A:null, B:null};           // 存放 HTMLImageElement
-let cvReady = false, hasResult = false;
+let cvReady = false, hasResult = false, resultBlob = null;
 
 /* ---------- 音效（共用 AudioContext，需由使用者操作觸發） ---------- */
 let actx = null;
@@ -282,7 +287,7 @@ $('compareBtn').addEventListener('click', () => {
   setTimeout(() => {                      // 讓遮罩先繪製，再做重運算
     try {
       setStatus(runCompare());
-      hasResult = true; $('downloadBtn').disabled = false; playSuccessSound();
+      hasResult = true; prepareBlob(); playSuccessSound();
     } catch (err) {
       console.error(err);
       setStatus('比對失敗：' + (typeof err === 'number' ? '記憶體不足，請改用較小的圖片' : err.message), true);
@@ -292,22 +297,51 @@ $('compareBtn').addEventListener('click', () => {
   }, 60);
 });
 
-/* ---------- 下載 JPG ---------- */
-$('downloadBtn').addEventListener('click', () => {
-  if (!hasResult) return;
+/* ---------- 下載 JPG（手機相容：預先產生 Blob → Web Share → <a download> → 長按儲存） ---------- */
+const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+                  (navigator.maxTouchPoints > 1 && /Mac/i.test(navigator.platform));
+function prepareBlob() {
+  resultBlob = null; $('downloadBtn').disabled = true;
   $('out').toBlob(b => {
-    if (!b) { setStatus('匯出失敗，請重試。', true); return; }
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(b);
-    a.download = '圖紙比對結果_' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.jpg';
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    if (b) { resultBlob = b; $('downloadBtn').disabled = false; }
+    else setStatus('結果圖輸出失敗（圖片可能過大），請改用較小的圖片。', true);
   }, 'image/jpeg', 0.92);
+}
+function showSaveModal() {
+  const m = $('saveModal'); $('saveImg').src = URL.createObjectURL(resultBlob); m.style.display = 'flex';
+}
+function hideSaveModal() {
+  const m = $('saveModal'); m.style.display = 'none';
+  const u = $('saveImg').src; $('saveImg').removeAttribute('src');
+  if (u.startsWith('blob:')) URL.revokeObjectURL(u);
+}
+$('saveClose').addEventListener('click', hideSaveModal);
+
+$('downloadBtn').addEventListener('click', async () => {
+  if (!resultBlob) { setStatus('結果圖尚未準備好，請稍候再試。', true); return; }
+  const name = '圖紙比對結果_' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.jpg';
+  const file = new File([resultBlob], name, {type: 'image/jpeg'});
+
+  // 手機：優先用系統分享面板（可「儲存影像」到相簿 / 檔案）
+  if (IS_MOBILE && navigator.canShare && navigator.canShare({files: [file]})) {
+    try { await navigator.share({files: [file], title: '圖紙比對結果'}); return; }
+    catch (e) { if (e && e.name === 'AbortError') return; }   // 使用者取消就不再重試
+  }
+  // 桌機 / 支援 download 屬性的瀏覽器
+  try {
+    const url = URL.createObjectURL(resultBlob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name; a.style.display = 'none';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch (e) {}
+  // 手機內建瀏覽器（LINE / FB 等）常忽略 download：顯示長按儲存的備援畫面
+  if (IS_MOBILE) showSaveModal();
 });
 
 /* ---------- 一鍵清除 ---------- */
 $('clearBtn').addEventListener('click', () => {
-  imgs.A = imgs.B = null; hasResult = false;
+  imgs.A = imgs.B = null; hasResult = false; resultBlob = null; hideSaveModal();
   ['fileA','fileB'].forEach(i => $(i).value = '');
   $('thumbA').textContent = $('thumbB').textContent = '尚未選擇';
   const o = $('out'); o.width = 400; o.height = 260; o.getContext('2d').clearRect(0,0,400,260);
