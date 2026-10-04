@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>室內裝修圖紙智慧比對系統</title>
+<style>
+:root{--paper:#f6f4ee;--card:#fff;--ink:#16243a;--mute:#5d6b80;--line:#d9d6cc;--accent:#c8321e;--ok:#1f7a4d}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;background:var(--paper);color:var(--ink);padding:1rem;min-height:100vh}
+.wrap{max-width:1200px;margin:0 auto;display:grid;gap:1rem;grid-template-columns:1fr}
+header{padding:.5rem 0 .25rem}
+h1{font-size:1.6rem;font-weight:800;letter-spacing:.02em}
+header p{color:var(--mute);margin-top:.35rem;font-size:.95rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem}
+.card h2{font-size:1rem;margin-bottom:.6rem}
+input[type=file]{width:100%;padding:.7rem;border:1.5px dashed var(--line);border-radius:8px;background:var(--paper);font-size:.9rem}
+.thumb{margin-top:.7rem;height:150px;border-radius:8px;background:var(--paper);display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--mute);font-size:.85rem}
+.thumb img{max-width:100%;max-height:100%}
+.row{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.8rem}
+button{flex:1 1 140px;border:0;border-radius:8px;padding:.8rem;font-size:.95rem;font-weight:700;cursor:pointer;font-family:inherit}
+#compareBtn{background:var(--ink);color:#fff}
+#downloadBtn{background:var(--ok);color:#fff}
+#clearBtn{background:#fff;color:var(--accent);border:1.5px solid var(--accent)}
+button:disabled{background:#d5d9df;color:#8b95a3;border:0;cursor:not-allowed}
+button:focus-visible,input:focus-visible{outline:3px solid #2f6fed;outline-offset:2px}
+label.s{display:block;font-size:.85rem;color:var(--mute);margin-top:.8rem}
+input[type=range]{width:100%}
+#status{font-size:.9rem;color:var(--mute);margin-top:.3rem}
+#status.err{color:var(--accent);font-weight:600}
+.canvas-box{margin-top:.6rem;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:.6rem;display:flex;justify-content:center;overflow:auto}
+canvas{max-width:100%;height:auto;background:#fff}
+#loading{display:none;position:fixed;inset:0;background:rgba(22,36,58,.8);color:#fff;z-index:9;align-items:center;justify-content:center;text-align:center;padding:2rem;font-weight:600}
+@media(min-width:768px){.wrap{grid-template-columns:repeat(2,1fr)}header,.result{grid-column:span 2}}
+@media(min-width:1024px){.wrap{grid-template-columns:repeat(3,1fr)}header,.result{grid-column:span 3}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>室內裝修圖紙智慧比對系統</h1>
+    <p>上傳兩張 JPG 圖紙，系統自動校正尺寸與角度，以紅色標出現場變動，並可下載結果。</p>
+  </header>
+
+  <section class="card">
+    <h2>基準圖（A 圖，原設計）</h2>
+    <input type="file" id="fileA" accept="image/jpeg,image/png,image/*">
+    <div class="thumb" id="thumbA">尚未選擇</div>
+  </section>
+
+  <section class="card">
+    <h2>比對圖（B 圖，現場施工後）</h2>
+    <input type="file" id="fileB" accept="image/jpeg,image/png,image/*">
+    <div class="thumb" id="thumbB">尚未選擇</div>
+  </section>
+
+  <section class="card">
+    <h2>控制面板</h2>
+    <p id="status" role="status">請先載入 OpenCV 與兩張圖紙…</p>
+    <label class="s">差異靈敏度：<b id="sensVal">35</b>（數值越小越敏感）</label>
+    <input type="range" id="sens" min="10" max="100" value="35">
+    <div class="row">
+      <button id="compareBtn" disabled>開始比對</button>
+      <button id="downloadBtn" disabled>下載 JPG</button>
+      <button id="clearBtn">一鍵清除</button>
+    </div>
+  </section>
+
+  <section class="card result">
+    <h2>比對結果（紅色區塊 = 變更處）</h2>
+    <div class="canvas-box"><canvas id="out" width="400" height="260"></canvas></div>
+  </section>
+</div>
+<div id="loading"><div>圖紙特徵分析與空間配準中…<br><small>請稍候</small></div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const MAXSIDE = 2000;                    // 運算最大邊長，避免手機/大圖記憶體爆掉
+const imgs = {A:null, B:null};           // 存放 HTMLImageElement
+let cvReady = false, hasResult = false;
+
+/* ---------- 音效（共用 AudioContext，需由使用者操作觸發） ---------- */
+let actx = null;
+function getCtx() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    if (!actx) actx = new AC();
+    if (actx.state === 'suspended') actx.resume();
+    return actx;
+  } catch (e) { return null; }
+}
+function tone(freq, start, dur, endFreq) {
+  const c = getCtx(); if (!c) return;
+  const o = c.createOscillator(), g = c.createGain(), t = c.currentTime + start;
+  o.type = 'sine';
+  o.frequency.setValueAtTime(freq, t);
+  if (endFreq) o.frequency.exponentialRampToValueAtTime(endFreq, t + dur);
+  g.gain.setValueAtTime(0.12, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(c.destination);
+  o.start(t); o.stop(t + dur);
+}
+function playClickSound()   { tone(800, 0, 0.06, 200); }
+function playSuccessSound() { tone(523.25, 0, 0.12); tone(659.25, 0.08, 0.27); }
+// 任何按鈕被按下都先播放點擊聲
+document.addEventListener('click', e => { if (e.target.closest('button:not(:disabled)')) playClickSound(); });
+
+/* ---------- 載入 OpenCV（含備援網址、逾時提示） ---------- */
+function loadOpenCV(urls, i = 0) {
+  if (i >= urls.length) { setStatus('OpenCV 載入失敗，請檢查網路後重新整理。', true); return; }
+  const s = document.createElement('script');
+  s.async = true; s.src = urls[i];
+  s.onerror = () => loadOpenCV(urls, i + 1);
+  s.onload = () => {
+    const done = () => { cvReady = true; setStatus('OpenCV 就緒，請上傳兩張圖紙。'); refresh(); };
+    // 新版 opencv.js 的 cv 可能是 Promise 或需等待 onRuntimeInitialized
+    if (typeof cv === 'function') { cv().then(m => { window.cv = m; done(); }); }
+    else if (cv && cv.then) { cv.then(m => { window.cv = m; done(); }); }
+    else if (cv && cv.Mat) { done(); }
+    else { cv.onRuntimeInitialized = done; }
+  };
+  document.head.appendChild(s);
+}
+loadOpenCV([
+  'https://docs.opencv.org/4.9.0/opencv.js',
+  'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-release.1/dist/opencv.js'
+]);
+
+function setStatus(t, err) { const s = $('status'); s.textContent = t; s.className = err ? 'err' : ''; }
+function refresh() { $('compareBtn').disabled = !(cvReady && imgs.A && imgs.B); }
+
+/* ---------- 圖片上傳 ---------- */
+function bindUpload(inputId, thumbId, key) {
+  $(inputId).addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    playClickSound();
+    const url = URL.createObjectURL(f);           // 比 FileReader 省記憶體
+    const img = new Image();
+    img.onload = () => {
+      imgs[key] = img;
+      $(thumbId).innerHTML = '';
+      const t = new Image(); t.src = url; t.alt = key + ' 圖預覽';
+      $(thumbId).appendChild(t);
+      setStatus(`${key} 圖已載入（${img.naturalWidth}×${img.naturalHeight}）。`);
+      refresh();
+    };
+    img.onerror = () => { setStatus('無法讀取此圖片，請改用 JPG 或 PNG。', true); };
+    img.src = url;
+  });
+}
+bindUpload('fileA', 'thumbA', 'A');
+bindUpload('fileB', 'thumbB', 'B');
+$('sens').addEventListener('input', e => $('sensVal').textContent = e.target.value);
+
+/* ---------- 工具：圖片 → 縮放後的 canvas（瀏覽器會自動套用 EXIF 方向） ---------- */
+function toCanvas(img, scaleTo) {
+  const w0 = img.naturalWidth, h0 = img.naturalHeight;
+  const k = Math.min(1, MAXSIDE / Math.max(w0, h0));
+  const c = document.createElement('canvas');
+  c.width = Math.round(w0 * k); c.height = Math.round(h0 * k);
+  const x = c.getContext('2d');
+  x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height);
+  x.drawImage(img, 0, 0, c.width, c.height);
+  return c;
+}
+
+/* ---------- 配準：嘗試 4 種旋轉（0/90/180/270），選內點最多者 ---------- */
+function registerBtoA(matA, grayA, matB) {
+  const orb = new cv.ORB(4000);
+  const kpA = new cv.KeyPointVector(), dA = new cv.Mat(), noMask = new cv.Mat();
+  orb.detectAndCompute(grayA, noMask, kpA, dA);
+  let best = {inl: 0, H: null};
+
+  for (let rot = 0; rot < 4; rot++) {
+    const rb = new cv.Mat();
+    if (rot === 0) matB.copyTo(rb);
+    else cv.rotate(matB, rb, [cv.ROTATE_90_CLOCKWISE, cv.ROTATE_180, cv.ROTATE_90_COUNTERCLOCKWISE][rot - 1]);
+    const gB = new cv.Mat(); cv.cvtColor(rb, gB, cv.COLOR_RGBA2GRAY);
+    const kpB = new cv.KeyPointVector(), dB = new cv.Mat();
+    orb.detectAndCompute(gB, noMask, kpB, dB);
+
+    if (dB.rows > 10 && dA.rows > 10) {
+      const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+      const mv = new cv.DMatchVectorVector();
+      bf.knnMatch(dB, dA, mv, 2);
+      const src = [], dst = [];
+      for (let i = 0; i < mv.size(); i++) {
+        const m = mv.get(i);
+        if (m.size() < 2) continue;
+        const a = m.get(0), b = m.get(1);
+        if (a.distance < 0.75 * b.distance) {
+          const p = kpB.get(a.queryIdx).pt, q = kpA.get(a.trainIdx).pt;
+          src.push(p.x, p.y); dst.push(q.x, q.y);
+        }
+      }
+      const n = src.length / 2;
+      if (n >= 12) {
+        const s = cv.matFromArray(n, 1, cv.CV_32FC2, src);
+        const d = cv.matFromArray(n, 1, cv.CV_32FC2, dst);
+        const msk = new cv.Mat();
+        const H = cv.findHomography(s, d, cv.RANSAC, 4, msk);
+        let inl = 0;
+        if (!H.empty()) for (let i = 0; i < msk.rows; i++) inl += msk.data[i];
+        if (inl > best.inl) {
+          if (best.H) best.H.delete();
+          if (best.rb) best.rb.delete();
+          best = {inl, H, rb: rb.clone(), rot};
+        } else H.delete();
+        s.delete(); d.delete(); msk.delete();
+      }
+      bf.delete(); mv.delete();
+    }
+    rb.delete(); gB.delete(); kpB.delete(); dB.delete();
+  }
+  orb.delete(); kpA.delete(); dA.delete(); noMask.delete();
+  return best;
+}
+
+/* ---------- 主流程 ---------- */
+function runCompare() {
+  const cA = toCanvas(imgs.A), cB = toCanvas(imgs.B);
+  const matA = cv.imread(cA), matB = cv.imread(cB);
+  const W = matA.cols, H = matA.rows;
+  const garyA = new cv.Mat(); cv.cvtColor(matA, garyA, cv.COLOR_RGBA2GRAY);
+
+  const reg = registerBtoA(matA, garyA, matB);
+  const warped = new cv.Mat(), valid = new cv.Mat();
+  let note;
+  if (reg.H && reg.inl >= 12) {
+    cv.warpPerspective(reg.rb, warped, reg.H, new cv.Size(W, H), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(255,255,255,255));
+    const ones = new cv.Mat(reg.rb.rows, reg.rb.cols, cv.CV_8UC1, new cv.Scalar(255));
+    cv.warpPerspective(ones, valid, reg.H, new cv.Size(W, H), cv.INTER_NEAREST, cv.BORDER_CONSTANT, new cv.Scalar(0));
+    const k = cv.Mat.ones(7, 7, cv.CV_8U); cv.erode(valid, valid, k); k.delete(); ones.delete();
+    note = `已自動校正尺寸與角度（特徵匹配點 ${reg.inl}，旋轉 ${reg.rot * 90}°）`;
+  } else {
+    cv.resize(matB, warped, new cv.Size(W, H), 0, 0, cv.INTER_AREA);
+    valid.create(H, W, cv.CV_8UC1); valid.setTo(new cv.Scalar(255));
+    note = '特徵點不足，已改用單純縮放對齊（結果可能含較多雜訊）';
+  }
+
+  // 差異偵測
+  const gB = new cv.Mat(), gA = new cv.Mat(), diff = new cv.Mat(), mask = new cv.Mat();
+  cv.cvtColor(warped, gB, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(garyA, gA, new cv.Size(5,5), 0);
+  cv.GaussianBlur(gB, gB, new cv.Size(5,5), 0);
+  cv.absdiff(gA, gB, diff);
+  cv.threshold(diff, mask, +$('sens').value, 255, cv.THRESH_BINARY);
+  cv.bitwise_and(mask, valid, mask);
+  const k3 = cv.Mat.ones(3, 3, cv.CV_8U);
+  cv.morphologyEx(mask, mask, cv.MORPH_OPEN, k3);
+  cv.dilate(mask, mask, k3, new cv.Point(-1,-1), 2);
+  k3.delete();
+
+  // 合成：A 圖變淡 + 紅色標示
+  const faded = new cv.Mat(), red = new cv.Mat(H, W, cv.CV_8UC4, new cv.Scalar(200,50,30,255));
+  const white = new cv.Mat(H, W, cv.CV_8UC4, new cv.Scalar(255,255,255,255));
+  cv.addWeighted(matA, 0.75, white, 0.25, 0, faded);
+  const tint = new cv.Mat(); cv.addWeighted(faded, 0.35, red, 0.65, 0, tint);
+  tint.copyTo(faded, mask);
+  const cs = new cv.Mat(); const contours = new cv.MatVector(), hier = new cv.Mat();
+  cv.findContours(mask, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+  let n = 0;
+  for (let i = 0; i < contours.size(); i++) {
+    const r = cv.boundingRect(contours.get(i));
+    if (r.width * r.height < 150) continue;
+    n++;
+    cv.rectangle(faded, new cv.Point(r.x, r.y), new cv.Point(r.x + r.width, r.y + r.height), new cv.Scalar(200,50,30,255), 2);
+  }
+  const out = $('out'); out.width = W; out.height = H;
+  cv.imshow(out, faded);
+
+  [matA, matB, garyA, warped, valid, gB, gA, diff, mask, faded, red, white, tint, cs, hier].forEach(m => m.delete());
+  contours.delete(); if (reg.H) reg.H.delete(); if (reg.rb) reg.rb.delete();
+  return `${note}；共標出 ${n} 處差異。`;
+}
+
+$('compareBtn').addEventListener('click', () => {
+  $('loading').style.display = 'flex';
+  $('compareBtn').disabled = true;
+  setTimeout(() => {                      // 讓遮罩先繪製，再做重運算
+    try {
+      setStatus(runCompare());
+      hasResult = true; $('downloadBtn').disabled = false; playSuccessSound();
+    } catch (err) {
+      console.error(err);
+      setStatus('比對失敗：' + (typeof err === 'number' ? '記憶體不足，請改用較小的圖片' : err.message), true);
+    } finally {
+      $('loading').style.display = 'none'; refresh();
+    }
+  }, 60);
+});
+
+/* ---------- 下載 JPG ---------- */
+$('downloadBtn').addEventListener('click', () => {
+  if (!hasResult) return;
+  $('out').toBlob(b => {
+    if (!b) { setStatus('匯出失敗，請重試。', true); return; }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = '圖紙比對結果_' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.jpg';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  }, 'image/jpeg', 0.92);
+});
+
+/* ---------- 一鍵清除 ---------- */
+$('clearBtn').addEventListener('click', () => {
+  imgs.A = imgs.B = null; hasResult = false;
+  ['fileA','fileB'].forEach(i => $(i).value = '');
+  $('thumbA').textContent = $('thumbB').textContent = '尚未選擇';
+  const o = $('out'); o.width = 400; o.height = 260; o.getContext('2d').clearRect(0,0,400,260);
+  $('downloadBtn').disabled = true; refresh();
+  setStatus(cvReady ? 'OpenCV 就緒，請上傳兩張圖紙。' : '請先載入 OpenCV 與兩張圖紙…');
+});
+</script>
+</body>
+</html>
